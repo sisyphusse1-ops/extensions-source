@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.id.mikoroku
 
+import android.net.Uri
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -10,11 +11,14 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import uy.kohesive.injekt.injectLazy
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 class MikoRoku : HttpSource() {
 
@@ -25,139 +29,175 @@ class MikoRoku : HttpSource() {
 
     private val json: Json by injectLazy()
 
-    // 1. FIREBASE API FOR CATALOG (Updated URL)[cite: 3]
-    private val firebaseApiUrl = "https://miko-roku-default-rtdb.firebaseio.com/manga.json"
+    // 1. THE CLOUDFLARE BYPASS: Direct Google Blogger API for the main catalog
+    private val blogId = "8503640819736488624"
+    private val catalogApiUrl = "https://www.blogger.com/feeds/$blogId/posts/default"
 
-    // 2. BLOGGER API FOR CHAPTERS
-    private val driveApiUrl = "https://www.mikodrive.my.id/feeds/posts/default?alt=json"
+    // 2. MikoDrive API for the chapters
+    private val driveApiUrl = "https://www.mikodrive.my.id/feeds/posts/default"
 
     // ==============================
-    // POPULAR & LATEST MANGA (FIREBASE)
+    // CATALOG & PAGINATION
     // ==============================
-    override fun popularMangaRequest(page: Int): Request = GET(firebaseApiUrl, headers)
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val jsonString = response.body?.string().orEmpty()
-        if (jsonString.isEmpty() || jsonString == "null") return MangasPage(emptyList(), false)
-
-        val data = json.parseToJsonElement(jsonString).jsonObject
-        val mangas = data.entries.mapNotNull { (slug, element) ->
-            try {
-                val obj = element.jsonObject
-                SManga.create().apply {
-                    url = "/detail?slug=$slug"
-                    title = obj["title"]?.jsonPrimitive?.content ?: ""
-                    thumbnail_url = obj["cover"]?.jsonPrimitive?.content ?: ""
-                }
-            } catch (e: Exception) {
-                null
-            }
-        }
-        return MangasPage(mangas, false)
+    override fun popularMangaRequest(page: Int): Request {
+        val startIndex = (page - 1) * 50 + 1
+        return GET("$catalogApiUrl?alt=json&max-results=50&start-index=$startIndex", headers)
     }
 
-    override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
-    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+    override fun latestUpdatesRequest(page: Int): Request {
+        val startIndex = (page - 1) * 50 + 1
+        return GET("$catalogApiUrl?alt=json&max-results=50&start-index=$startIndex&orderby=published", headers)
+    }
 
-    // ==============================
-    // SEARCH & FILTERS (CLIENT-SIDE)
-    // ==============================
-    override fun getFilterList() = FilterList(
-        StatusFilter(),
-        TypeFilter(),
-        GenreFilter()
-    )
-
-    private class StatusFilter : Filter.Select<String>("Status", arrayOf("Semua", "Ongoing", "Completed", "Hiatus", "Dropped"))
-    private class TypeFilter : Filter.Select<String>("Type", arrayOf("Semua", "Manga", "Manhua", "Manhwa", "Novel"))
-    private class GenreFilter : Filter.Select<String>("Genre", arrayOf("Semua", "Action", "Adventure", "Comedy", "Dark Fantasy", "Drama", "Fantasy", "Historical", "Horror", "Isekai", "Magic", "Mecha", "Military", "Mystery", "Psychological", "Romance", "School Life", "Sci-Fi", "Seinen", "Shounen", "Slice of Life", "Supernatural", "Survival", "Tragedy"))
+    override fun popularMangaParse(response: Response): MangasPage = parseCatalog(response)
+    override fun latestUpdatesParse(response: Response): MangasPage = parseCatalog(response)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val headersBuilder = headersBuilder().apply {
-            add("tachi-query", query)
-            filters.forEach { filter ->
-                when (filter) {
-                    is StatusFilter -> if (filter.state != 0) add("tachi-status", filter.values[filter.state])
-                    is TypeFilter -> if (filter.state != 0) add("tachi-type", filter.values[filter.state])
-                    is GenreFilter -> if (filter.state != 0) add("tachi-genre", filter.values[filter.state])
-                    else -> {} // Exhaustive fix
-                }
+        val startIndex = (page - 1) * 50 + 1
+        var url = catalogApiUrl
+        val categories = mutableListOf<String>()
+
+        filters.forEach { filter ->
+            when (filter) {
+                is StatusFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
+                is TypeFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
+                is GenreFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
+                else -> {}
             }
         }
-        return GET(firebaseApiUrl, headersBuilder.build())
+
+        if (categories.isNotEmpty()) {
+            url += "/-/" + categories.joinToString("/") { Uri.encode(it) }
+        }
+
+        url += "?alt=json&max-results=50&start-index=$startIndex"
+
+        if (query.isNotBlank()) {
+            url += "&q=${Uri.encode(query)}"
+        }
+
+        return GET(url, headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val query = response.request.header("tachi-query") ?: ""
-        val statusFilter = response.request.header("tachi-status")
-        val typeFilter = response.request.header("tachi-type")
-        val genreFilter = response.request.header("tachi-genre")
+    override fun searchMangaParse(response: Response): MangasPage = parseCatalog(response)
 
+    private fun parseCatalog(response: Response): MangasPage {
         val jsonString = response.body?.string().orEmpty()
-        if (jsonString.isEmpty() || jsonString == "null") return MangasPage(emptyList(), false)
+        if (response.code == 404 || jsonString.isEmpty() || !jsonString.contains("\"entry\":")) {
+            return MangasPage(emptyList(), false)
+        }
 
-        val data = json.parseToJsonElement(jsonString).jsonObject
-        val mangas = data.entries.mapNotNull { (slug, element) ->
-            try {
-                val obj = element.jsonObject
-                val title = obj["title"]?.jsonPrimitive?.content ?: ""
-                val status = obj["status"]?.jsonPrimitive?.content ?: ""
-                val type = obj["type"]?.jsonPrimitive?.content ?: ""
-                
-                val genresElement = obj["genres"]
-                val genres = if (genresElement is JsonArray) {
-                    genresElement.map { it.jsonPrimitive.content }
-                } else emptyList()
+        // Using safe casting (as?) to prevent any compiler errors
+        val resJson = json.parseToJsonElement(jsonString) as? JsonObject ?: return MangasPage(emptyList(), false)
+        val feed = resJson["feed"] as? JsonObject ?: return MangasPage(emptyList(), false)
+        val entries = feed["entry"] as? JsonArray ?: return MangasPage(emptyList(), false)
 
-                // Client-side filtering logic[cite: 4]
-                if (query.isNotBlank() && !title.contains(query, ignoreCase = true)) return@mapNotNull null
-                if (statusFilter != null && !status.equals(statusFilter, ignoreCase = true)) return@mapNotNull null
-                if (typeFilter != null && !type.equals(typeFilter, ignoreCase = true)) return@mapNotNull null
-                if (genreFilter != null && !genres.any { it.equals(genreFilter, ignoreCase = true) }) return@mapNotNull null
+        val mangas = entries.mapNotNull { element ->
+            val entry = element as? JsonObject ?: return@mapNotNull null
+            val titleObj = entry["title"] as? JsonObject
+            val title = titleObj?.get("\$t")?.jsonPrimitive?.content ?: return@mapNotNull null
 
-                SManga.create().apply {
-                    this.url = "/detail?slug=$slug"
-                    this.title = title
-                    this.thumbnail_url = obj["cover"]?.jsonPrimitive?.content ?: ""
-                }
-            } catch (e: Exception) {
-                null
+            val linkArray = entry["link"] as? JsonArray
+            val link = linkArray?.firstNotNullOfOrNull { item ->
+                val l = item as? JsonObject
+                if (l?.get("rel")?.jsonPrimitive?.content == "alternate") l["href"]?.jsonPrimitive?.content else null
+            } ?: return@mapNotNull null
+
+            val mediaThumb = entry["media\$thumbnail"] as? JsonObject
+            val thumbRaw = mediaThumb?.get("url")?.jsonPrimitive?.content ?: ""
+            val thumbHighRes = thumbRaw.replace("/s72-c/", "/s600/")
+
+            SManga.create().apply {
+                this.title = title
+                this.url = link.substringAfter(".com").substringAfter(".top")
+                this.thumbnail_url = thumbHighRes
             }
         }
-        return MangasPage(mangas, false)
+        return MangasPage(mangas, mangas.size == 50)
     }
 
     // ==============================
-    // MANGA DETAILS (FIREBASE)
-    // ==============================
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        return GET(baseUrl + manga.url, headers)
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        return SManga.create()
-    }
-
-    // ==============================
-    // CHAPTER LIST (MIKODRIVE BLOGGER API)
+    // CHAPTER LIST (MIKODRIVE API)
     // ==============================
     override fun chapterListRequest(manga: SManga): Request {
-        val query = manga.title.replace(" ", "+")
-        return GET("$driveApiUrl&q=$query&max-results=200", headers)
+        val encodedTitle = Uri.encode(manga.title)
+        return GET("$driveApiUrl/-/$encodedTitle?alt=json&max-results=500", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        return emptyList() // Placeholder for detailed Blogger parsing
+        val jsonString = response.body?.string().orEmpty()
+        if (response.code == 404 || jsonString.isEmpty() || !jsonString.contains("\"entry\":")) {
+            return emptyList()
+        }
+
+        val resJson = json.parseToJsonElement(jsonString) as? JsonObject ?: return emptyList()
+        val feed = resJson["feed"] as? JsonObject ?: return emptyList()
+        val entries = feed["entry"] as? JsonArray ?: return emptyList()
+
+        return entries.mapNotNull { element ->
+            val entryObj = element as? JsonObject ?: return@mapNotNull null
+            val titleObj = entryObj["title"] as? JsonObject
+            val title = titleObj?.get("\$t")?.jsonPrimitive?.content ?: ""
+
+            val linkArray = entryObj["link"] as? JsonArray
+            val link = linkArray?.firstNotNullOfOrNull { item ->
+                val l = item as? JsonObject
+                if (l?.get("rel")?.jsonPrimitive?.content == "alternate") l["href"]?.jsonPrimitive?.content else null
+            } ?: return@mapNotNull null
+
+            val chapterRegex = "chapter\\s*(\\d+(\\.\\d+)?)".toRegex(RegexOption.IGNORE_CASE)
+            val match = chapterRegex.find(title)
+            val chapNum = match?.groupValues?.get(1)?.toFloatOrNull() ?: 0f
+
+            val cleanTitle = match?.value?.replace("chapter", "Chapter", ignoreCase = true) ?: title
+
+            val pubObj = entryObj["published"] as? JsonObject
+            val pubDate = pubObj?.get("\$t")?.jsonPrimitive?.content
+
+            SChapter.create().apply {
+                this.url = link
+                this.name = cleanTitle
+                this.chapter_number = chapNum
+                this.date_upload = parseDate(pubDate)
+            }
+        }.sortedByDescending { it.chapter_number }
+    }
+
+    private fun parseDate(dateStr: String?): Long = try {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+        sdf.parse(dateStr!!.substring(0, 19))?.time ?: 0L
+    } catch (e: Exception) {
+        0L
     }
 
     // ==============================
     // PAGES
     // ==============================
-    override fun pageListRequest(chapter: SChapter): Request = GET(chapter.url, headers)
+    override fun pageListRequest(chapter: SChapter): Request = GET(chapter.url, headersBuilder().add("Referer", chapter.url).build())
 
     override fun pageListParse(response: Response): List<Page> {
-        return emptyList()
+        val html = response.body?.string().orEmpty()
+        val doc = Jsoup.parse(html)
+
+        val imgTags = doc.select(".post-body img, #post-body img, .separator img, div[itemprop=articleBody] img")
+
+        return imgTags.mapIndexedNotNull { i, img ->
+            var url = img.attr("src")
+            if (url.isBlank()) url = img.attr("data-src")
+            if (url.startsWith("http")) Page(i, "", url) else null
+        }
     }
 
     override fun imageUrlParse(response: Response): String = ""
+
+    // ==============================
+    // FILTERS & DETAILS
+    // ==============================
+    override fun getFilterList() = FilterList(StatusFilter(), TypeFilter(), GenreFilter())
+
+    private class StatusFilter : Filter.Select<String>("Status", arrayOf("Semua", "Ongoing", "Completed", "Hiatus", "Dropped", "Cancelled"))
+    private class TypeFilter : Filter.Select<String>("Type", arrayOf("Semua", "Manga", "Manhua", "Manhwa", "Doujin", "Doujinshi"))
+    private class GenreFilter : Filter.Select<String>("Genre", arrayOf("Semua", "Action", "Adventure", "Comedy", "Dark Fantasy", "Demon", "Drama", "Ecchi", "Fantasy", "Game", "Gore", "Harem", "Hentai", "Historical", "Horror", "Isekai", "Loli", "Magic", "Mature", "Mecha", "Military", "Monsters", "Mystery", "Psychological", "Reincarnation", "Romance", "School Life", "Sci-Fi", "Seinen", "Shota", "Shounen", "Slice of Life", "Supernatural", "Survival", "Tragedy", "Yandere", "Zombie"))
+
+    override fun mangaDetailsParse(response: Response): SManga = SManga.create()
 }
