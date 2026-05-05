@@ -61,8 +61,14 @@ class MikoRoku : HttpSource() {
 
         filters.forEach { filter ->
             when (filter) {
-                is StatusFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
-                is GenreFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
+                is StatusFilter -> {
+                    val status = filter.statuses[filter.state].value
+                    if (status.isNotEmpty()) categories.add(status)
+                }
+                is GenreFilter -> {
+                    val genre = filter.genres[filter.state].value
+                    if (genre.isNotEmpty()) categories.add(genre)
+                }
                 else -> {}
             }
         }
@@ -142,7 +148,6 @@ class MikoRoku : HttpSource() {
             val fullId = idObj?.get("\$t")?.jsonPrimitive?.content ?: ""
             val postId = fullId.substringAfter("post-")
 
-            // FIXED: Used entryObj instead of entry
             val linkArray = entryObj["link"] as? JsonArray
             val link = linkArray?.firstNotNullOfOrNull { item ->
                 val l = item as? JsonObject
@@ -186,7 +191,6 @@ class MikoRoku : HttpSource() {
 
         val document = Jsoup.parse(contentHtml)
 
-        // Maintained original ZeistManga selectors
         val images = when {
             document.selectFirst("div.check-box") != null ->
                 document.select("div.check-box div.separator img[src]")
@@ -208,30 +212,54 @@ class MikoRoku : HttpSource() {
 
     override fun imageUrlParse(response: Response): String = ""
 
-    override fun getFilterList() = FilterList(StatusFilter(), GenreFilter())
+    // ==============================
+    // FILTERS
+    // ==============================
 
-    private class StatusFilter :
-        Filter.Select<String>(
-            "Status",
-            arrayOf(
-                "Semua",
-                "Ongoing",
-                "Completed",
-                "Hiatus",
-                "Dropped",
-                "Cancelled",
-            ),
-        )
+    // Custom data classes to replicate ZeistManga functionality
+    class Status(val name: String, val value: String)
+    class Genre(val name: String, val value: String)
 
-    private class GenreFilter :
-        Filter.Select<String>(
-            "Genre",
-            arrayOf(
-                "Semua", "Action", "Adventure", "Comedy", "Dark Fantasy", "Demon", "Drama", "Ecchi", "Fantasy",
-                "Game", "Gore", "Harem", "Hentai", "Historical", "Horror", "Isekai", "Loli", "Magic", "Mature",
-                "Mecha", "Military", "Monsters", "Mystery", "Psychological", "Reincarnation", "Romance",
-                "School Life", "Sci-Fi", "Seinen", "Shota", "Shounen", "Slice of Life", "Supernatural",
-                "Survival", "Tragedy", "Yandere", "Zombie",
-            ),
-        )
+    private fun getStatusList() = listOf(
+        Status("Semua", ""),
+        Status("Ongoing", "Ongoing"),
+        Status("Completed", "Completed"),
+        Status("Hiatus", "Hiatus"),
+        Status("Dropped", "Dropped"),
+    )
+
+    private fun getGenreList() = listOf(
+        Genre("Semua", ""), // Added fallback default
+        Genre("Action", "Action"),
+        Genre("Adventure", "Adventure"),
+        Genre("Comedy", "Comedy"),
+        Genre("Dark Fantasy", "Dark Fantasy"),
+        Genre("Drama", "Drama"),
+        Genre("Fantasy", "Fantasy"),
+        Genre("Historical", "Historical"),
+        Genre("Horror", "Horror"),
+        Genre("Isekai", "Isekai"),
+        Genre("Magic", "Magic"),
+        Genre("Mecha", "Mecha"),
+        Genre("Military", "Military"),
+        Genre("Mystery", "Mystery"),
+        Genre("Psychological", "Psychological"),
+        Genre("Romance", "Romance"),
+        Genre("School Life", "School Life"),
+        Genre("Sci-Fi", "Sci-Fi"),
+        Genre("Seinen", "Seinen"),
+        Genre("Shounen", "Shounen"),
+        Genre("Slice of Life", "Slice of Life"),
+        Genre("Supernatural", "Supernatural"),
+        Genre("Survival", "Survival"),
+        Genre("Tragedy", "Tragedy"),
+    )
+
+    private class StatusFilter(val statuses: List<Status>) : Filter.Select<String>("Status", statuses.map { it.name }.toTypedArray())
+    private class GenreFilter(val genres: List<Genre>) : Filter.Select<String>("Genre", genres.map { it.name }.toTypedArray())
+
+    override fun getFilterList() = FilterList(
+        StatusFilter(getStatusList()),
+        GenreFilter(getGenreList()),
+    )
 }
