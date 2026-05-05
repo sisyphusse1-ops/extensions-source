@@ -1,6 +1,5 @@
 package eu.kanade.tachiyomi.extension.id.mikoroku
 
-import android.net.Uri
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -31,33 +30,17 @@ class MikoRoku : HttpSource() {
 
     private val json: Json by injectLazy()
 
-    // 1. Direct Google Blogger API for the main catalog
     private val blogId = "8503640819736488624"
     private val catalogApiUrl = "https://www.blogger.com/feeds/$blogId/posts/default"
-
-    // 2. MikoDrive API for the chapter list
     private val driveApiUrl = "https://www.mikodrive.my.id/feeds/posts/default"
 
     override fun headersBuilder() = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
         .add("Referer", baseUrl)
 
-    // ==============================
-    // WEBVIEW URL OVERRIDES
-    // ==============================
-    override fun getMangaUrl(manga: SManga): String {
-        // This will successfully open the modern frontend (e.g., https://mikoroku.com/detail?slug=...)
-        return baseUrl + manga.url
-    }
+    override fun getMangaUrl(manga: SManga): String = baseUrl + manga.url
+    override fun getChapterUrl(chapter: SChapter): String = chapter.url.substringAfter("||")
 
-    override fun getChapterUrl(chapter: SChapter): String {
-        // Fallback to the main website for the chapter webview to avoid mikodrive 404s
-        return baseUrl
-    }
-
-    // ==============================
-    // CATALOG & PAGINATION
-    // ==============================
     override fun popularMangaRequest(page: Int): Request {
         val startIndex = (page - 1) * 50 + 1
         return GET("$catalogApiUrl?alt=json&max-results=50&start-index=$startIndex", headers)
@@ -79,7 +62,6 @@ class MikoRoku : HttpSource() {
         filters.forEach { filter ->
             when (filter) {
                 is StatusFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
-                is TypeFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
                 is GenreFilter -> if (filter.state != 0) categories.add(filter.values[filter.state])
                 else -> {}
             }
@@ -101,7 +83,7 @@ class MikoRoku : HttpSource() {
     override fun searchMangaParse(response: Response): MangasPage = parseCatalog(response)
 
     private fun parseCatalog(response: Response): MangasPage {
-        val jsonString = response.body?.string().orEmpty()
+        val jsonString = response.body.string()
         if (response.code == 404 || jsonString.isEmpty() || !jsonString.contains("\"entry\":")) {
             return MangasPage(emptyList(), false)
         }
@@ -121,33 +103,28 @@ class MikoRoku : HttpSource() {
                 if (l?.get("rel")?.jsonPrimitive?.content == "alternate") l["href"]?.jsonPrimitive?.content else null
             } ?: return@mapNotNull null
 
-            // FIX 1: Extract the exact slug so it matches the modern website structure
             val slug = link.substringAfterLast("/").removeSuffix(".html")
-
             val mediaThumb = entry["media\$thumbnail"] as? JsonObject
             val thumbRaw = mediaThumb?.get("url")?.jsonPrimitive?.content ?: ""
-            val thumbHighRes = thumbRaw.replace("/s72-c/", "/s600/")
 
             SManga.create().apply {
                 this.title = title
-                this.url = "/detail?slug=$slug" // Matches mikoroku.com routing perfectly
-                this.thumbnail_url = thumbHighRes
+                this.url = "/detail?slug=$slug"
+                this.thumbnail_url = thumbRaw.replace("/s72-c/", "/s600/")
             }
         }
         return MangasPage(mangas, mangas.size == 50)
     }
 
-    // ==============================
-    // CHAPTER LIST (MIKODRIVE API)
-    // ==============================
+    override fun mangaDetailsParse(response: Response): SManga = SManga.create()
+
     override fun chapterListRequest(manga: SManga): Request {
         val encodedTitle = URLEncoder.encode(manga.title.trim(), "UTF-8").replace("+", "%20")
         return GET("$driveApiUrl/-/$encodedTitle?alt=json&max-results=500", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val jsonString = response.body?.string().orEmpty()
-        // If a manga hasn't uploaded chapters yet, Blogger returns a 404. This safely ignores it.
+        val jsonString = response.body.string()
         if (response.code == 404 || jsonString.isEmpty() || !jsonString.contains("\"entry\":")) {
             return emptyList()
         }
@@ -161,10 +138,16 @@ class MikoRoku : HttpSource() {
             val titleObj = entryObj["title"] as? JsonObject
             val title = titleObj?.get("\$t")?.jsonPrimitive?.content ?: ""
 
-            // FIX 2: Extract the pure Post ID so we can bypass HTML scraping entirely
             val idObj = entryObj["id"] as? JsonObject
             val fullId = idObj?.get("\$t")?.jsonPrimitive?.content ?: ""
             val postId = fullId.substringAfter("post-")
+
+            // FIXED: Used entryObj instead of entry
+            val linkArray = entryObj["link"] as? JsonArray
+            val link = linkArray?.firstNotNullOfOrNull { item ->
+                val l = item as? JsonObject
+                if (l?.get("rel")?.jsonPrimitive?.content == "alternate") l["href"]?.jsonPrimitive?.content else null
+            } ?: ""
 
             val chapterRegex = "chapter\\s*(\\d+(\\.\\d+)?)".toRegex(RegexOption.IGNORE_CASE)
             val match = chapterRegex.find(title)
@@ -175,32 +158,25 @@ class MikoRoku : HttpSource() {
             val pubDate = pubObj?.get("\$t")?.jsonPrimitive?.content
 
             SChapter.create().apply {
-                this.url = postId // We only pass the post ID to the page fetcher
+                this.url = "$postId||$link"
                 this.name = cleanTitle
                 this.chapter_number = chapNum
-                this.date_upload = parseDate(pubDate)
+                this.date_upload = try {
+                    SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault()).parse(pubDate!!.substring(0, 19))?.time ?: 0L
+                } catch (e: Exception) {
+                    0L
+                }
             }
         }.sortedByDescending { it.chapter_number }
     }
 
-    private fun parseDate(dateStr: String?): Long {
-        return try {
-            val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
-            sdf.parse(dateStr!!.substring(0, 19))?.time ?: 0L
-        } catch (e: Exception) { 0L }
-    }
-
-    // ==============================
-    // PAGES (DIRECT JSON FETCH)
-    // ==============================
     override fun pageListRequest(chapter: SChapter): Request {
-        // FIX 3: Fetch the raw JSON directly from Blogger's servers, completely bypassing the mikodrive 404 block
-        val postId = chapter.url
+        val postId = chapter.url.substringBefore("||")
         return GET("$driveApiUrl/$postId?alt=json", headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val jsonString = response.body?.string().orEmpty()
+        val jsonString = response.body.string()
         if (response.code == 404 || jsonString.isEmpty()) return emptyList()
 
         val resJson = json.parseToJsonElement(jsonString) as? JsonObject ?: return emptyList()
@@ -208,27 +184,54 @@ class MikoRoku : HttpSource() {
         val contentObj = entry["content"] as? JsonObject
         val contentHtml = contentObj?.get("\$t")?.jsonPrimitive?.content.orEmpty()
 
-        // Extract the images hidden inside the JSON payload
-        val doc = Jsoup.parse(contentHtml)
-        val imgTags = doc.select("img")
+        val document = Jsoup.parse(contentHtml)
 
-        return imgTags.mapIndexedNotNull { i, img ->
-            var url = img.attr("src")
+        // Maintained original ZeistManga selectors
+        val images = when {
+            document.selectFirst("div.check-box") != null ->
+                document.select("div.check-box div.separator img[src]")
+            document.selectFirst("div[data=imageProtection]") != null ->
+                document.select("div[data=imageProtection] div.separator img[src]")
+            document.selectFirst("#post-body div.separator") != null ->
+                document.select("#post-body div.separator img[src]")
+            else ->
+                document.select(".post-body div.separator img[src], img[src]")
+        }
+
+        return images.mapIndexedNotNull { index, img ->
+            var url = img.attr("abs:src")
+            if (url.isBlank()) url = img.attr("src")
             if (url.isBlank()) url = img.attr("data-src")
-            if (url.startsWith("http")) Page(i, "", url) else null
+            if (url.startsWith("http")) Page(index, "", url) else null
         }
     }
 
     override fun imageUrlParse(response: Response): String = ""
 
-    // ==============================
-    // FILTERS & DETAILS
-    // ==============================
-    override fun getFilterList() = FilterList(StatusFilter(), TypeFilter(), GenreFilter())
+    override fun getFilterList() = FilterList(StatusFilter(), GenreFilter())
 
-    private class StatusFilter : Filter.Select<String>("Status", arrayOf("Semua", "Ongoing", "Completed", "Hiatus", "Dropped", "Cancelled"))
-    private class TypeFilter : Filter.Select<String>("Type", arrayOf("Semua", "Manga", "Manhua", "Manhwa", "Doujin", "Doujinshi"))
-    private class GenreFilter : Filter.Select<String>("Genre", arrayOf("Semua", "Action", "Adventure", "Comedy", "Dark Fantasy", "Demon", "Drama", "Ecchi", "Fantasy", "Game", "Gore", "Harem", "Hentai", "Historical", "Horror", "Isekai", "Loli", "Magic", "Mature", "Mecha", "Military", "Monsters", "Mystery", "Psychological", "Reincarnation", "Romance", "School Life", "Sci-Fi", "Seinen", "Shota", "Shounen", "Slice of Life", "Supernatural", "Survival", "Tragedy", "Yandere", "Zombie"))
+    private class StatusFilter :
+        Filter.Select<String>(
+            "Status",
+            arrayOf(
+                "Semua",
+                "Ongoing",
+                "Completed",
+                "Hiatus",
+                "Dropped",
+                "Cancelled",
+            ),
+        )
 
-    override fun mangaDetailsParse(response: Response): SManga = SManga.create()
+    private class GenreFilter :
+        Filter.Select<String>(
+            "Genre",
+            arrayOf(
+                "Semua", "Action", "Adventure", "Comedy", "Dark Fantasy", "Demon", "Drama", "Ecchi", "Fantasy",
+                "Game", "Gore", "Harem", "Hentai", "Historical", "Horror", "Isekai", "Loli", "Magic", "Mature",
+                "Mecha", "Military", "Monsters", "Mystery", "Psychological", "Reincarnation", "Romance",
+                "School Life", "Sci-Fi", "Seinen", "Shota", "Shounen", "Slice of Life", "Supernatural",
+                "Survival", "Tragedy", "Yandere", "Zombie",
+            ),
+        )
 }
