@@ -21,7 +21,7 @@ class MikoRoku : HttpSource() {
     override val supportsLatest = true
 
     private val json: Json by injectLazy()
-    
+
     // 1. FIREBASE API FOR CATALOG
     private val firebaseApiUrl = "https://miko-roku.firebaseio.com/manga.json"
 
@@ -31,9 +31,7 @@ class MikoRoku : HttpSource() {
     // ==============================
     // POPULAR & LATEST MANGA (FIREBASE)
     // ==============================
-    override fun popularMangaRequest(page: Int): Request {
-        return GET(firebaseApiUrl, headers)
-    }
+    override fun popularMangaRequest(page: Int): Request = GET(firebaseApiUrl, headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val jsonString = response.body?.string().orEmpty()
@@ -98,7 +96,7 @@ class MikoRoku : HttpSource() {
     }
 
     override fun imageUrlParse(response: Response): String = ""
-    
+
     // We disable search for this initial rewrite structure to keep it simple
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException("Not used.")
     override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException("Not used.")
