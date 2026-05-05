@@ -1,89 +1,105 @@
 package eu.kanade.tachiyomi.extension.id.mikoroku
 
-import eu.kanade.tachiyomi.multisrc.zeistmanga.Genre
-import eu.kanade.tachiyomi.multisrc.zeistmanga.Status
-import eu.kanade.tachiyomi.multisrc.zeistmanga.ZeistManga
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import okhttp3.Request
 import okhttp3.Response
+import uy.kohesive.injekt.injectLazy
 
-class MikoRoku : ZeistManga("MikoRoku", "https://www.mikoroku.top", "id") {
+class MikoRoku : HttpSource() {
 
-    override fun popularMangaRequest(page: Int) = latestUpdatesRequest(page)
-    override fun popularMangaParse(response: Response) = searchMangaParse(response)
+    override val name = "MikoRoku"
+    override val baseUrl = "https://mikoroku.com"
+    override val lang = "id"
+    override val supportsLatest = true
 
-    override val hasFilters = true
-    override val hasLanguageFilter = false
-    override val hasTypeFilter = false
+    private val json: Json by injectLazy()
+    
+    // 1. FIREBASE API FOR CATALOG
+    private val firebaseApiUrl = "https://miko-roku.firebaseio.com/manga.json"
 
-    override fun getStatusList() = listOf(
-        Status("Semua", ""),
-        Status("Ongoing", "Ongoing"),
-        Status("Completed", "Completed"),
-        Status("Hiatus", "Hiatus"),
-        Status("Dropped", "Dropped"),
-    )
+    // 2. BLOGGER API FOR CHAPTERS
+    private val driveApiUrl = "https://www.mikodrive.my.id/feeds/posts/default?alt=json"
 
-    override fun getGenreList() = listOf(
-        Genre("Action", "Action"),
-        Genre("Adventure", "Adventure"),
-        Genre("Comedy", "Comedy"),
-        Genre("Dark Fantasy", "Dark Fantasy"),
-        Genre("Drama", "Drama"),
-        Genre("Fantasy", "Fantasy"),
-        Genre("Historical", "Historical"),
-        Genre("Horror", "Horror"),
-        Genre("Isekai", "Isekai"),
-        Genre("Magic", "Magic"),
-        Genre("Mecha", "Mecha"),
-        Genre("Military", "Military"),
-        Genre("Mystery", "Mystery"),
-        Genre("Psychological", "Psychological"),
-        Genre("Romance", "Romance"),
-        Genre("School Life", "School Life"),
-        Genre("Sci-Fi", "Sci-Fi"),
-        Genre("Seinen", "Seinen"),
-        Genre("Shounen", "Shounen"),
-        Genre("Slice of Life", "Slice of Life"),
-        Genre("Supernatural", "Supernatural"),
-        Genre("Survival", "Survival"),
-        Genre("Tragedy", "Tragedy"),
-    )
+    // ==============================
+    // POPULAR & LATEST MANGA (FIREBASE)
+    // ==============================
+    override fun popularMangaRequest(page: Int): Request {
+        return GET(firebaseApiUrl, headers)
+    }
+
+    override fun popularMangaParse(response: Response): MangasPage {
+        val jsonString = response.body?.string().orEmpty()
+        if (jsonString.isEmpty() || jsonString == "null") return MangasPage(emptyList(), false)
+
+        val data = json.parseToJsonElement(jsonString).jsonObject
+        val mangas = data.entries.mapNotNull { (slug, element) ->
+            try {
+                val obj = element.jsonObject
+                SManga.create().apply {
+                    url = "/detail?slug=$slug"
+                    title = obj["title"]?.toString()?.replace("\"", "") ?: ""
+                    thumbnail_url = obj["cover"]?.toString()?.replace("\"", "") ?: ""
+                    // Type, Status, etc. match the firebasepost.js structure
+                }
+            } catch (e: Exception) {
+                null
+            }
+        }
+        return MangasPage(mangas, false) // Firebase loads everything at once, no pagination needed yet
+    }
+
+    override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
+    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+
+    // ==============================
+    // MANGA DETAILS (FIREBASE)
+    // ==============================
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        // We can just use the webview URL for the details page
+        return GET(baseUrl + manga.url, headers)
+    }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        val header = document.selectFirst("header[itemprop=mainEntity]")
-            ?: document.selectFirst("header.bg-white")!!
-
-        return SManga.create().apply {
-            thumbnail_url = header.selectFirst("img.thumb")?.attr("abs:src")
-            title = header.selectFirst("h1[itemprop=name]")?.text()!!
-            status = parseStatus(header.selectFirst("span[data-status]")?.text()!!)
-            description = document.selectFirst("#synopsis")?.ownText()?.trim()
-            author = document.select("#extra-info .y6x11p")
-                .firstOrNull { it.ownText().contains("Author", ignoreCase = true) }
-                ?.selectFirst("span.dt")?.text()
-        }
+        // In a full implementation, we'd parse the Firebase data or HTML here
+        // For now, returning an empty SManga lets the catalog data carry over
+        return SManga.create()
     }
 
-    override val chapterCategory: String = "Chapter"
+    // ==============================
+    // CHAPTER LIST (MIKODRIVE BLOGGER API)
+    // ==============================
+    override fun chapterListRequest(manga: SManga): Request {
+        // Fetch chapters from the hidden mikodrive.my.id blogger backend
+        val query = manga.title.replace(" ", "+")
+        return GET("$driveApiUrl&q=$query&max-results=200", headers)
+    }
+
+    override fun chapterListParse(response: Response): List<SChapter> {
+        // Needs proper Blogger JSON parsing logic here based on script.js
+        return emptyList()
+    }
+
+    // ==============================
+    // PAGES
+    // ==============================
+    override fun pageListRequest(chapter: SChapter): Request = GET(chapter.url, headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val images = when {
-            document.selectFirst("div.check-box") != null ->
-                document.select("div.check-box div.separator img[src]")
-            document.selectFirst("div[data=imageProtection]") != null ->
-                document.select("div[data=imageProtection] div.separator img[src]")
-            document.selectFirst("#post-body div.separator") != null ->
-                document.select("#post-body div.separator img[src]")
-            else ->
-                document.select(".post-body div.separator img[src]")
-        }
-
-        return images.mapIndexed { index, img ->
-            Page(index, imageUrl = img.attr("abs:src"))
-        }
+        // Needs proper Blogger HTML image scraping here
+        return emptyList()
     }
+
+    override fun imageUrlParse(response: Response): String = ""
+    
+    // We disable search for this initial rewrite structure to keep it simple
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException("Not used.")
+    override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException("Not used.")
 }
